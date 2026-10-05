@@ -1142,6 +1142,7 @@ void Application::StartNotification(std::string audio_url, std::vector<NotifySub
 
     if (!started) {
         ESP_LOGE(TAG, "Failed to start notification playback");
+        if (!media_base_url_.empty()) media_request_status_.store(3);
         StopNotification();
     }
 }
@@ -1152,6 +1153,7 @@ bool Application::QueueMedia(std::string url) {
         url.find("/media/opus/") == std::string::npos) {
         return false;
     }
+    media_request_status_.store(1);
     Schedule([this, url = std::move(url)]() {
         if (GetDeviceState() == kDeviceStateNotifying) {
             StopNotification();
@@ -1165,6 +1167,7 @@ bool Application::QueueMedia(std::string url) {
 }
 
 void Application::StopMedia() {
+    media_request_status_.store(0);
     Schedule([this]() {
         pending_media_url_.clear();
         media_base_url_.clear();
@@ -1215,6 +1218,7 @@ void Application::HandleNotificationFinished(uint32_t playback_id, bool success)
     }
     ESP_LOGI(TAG, "Notification playback %lu %s", static_cast<unsigned long>(playback_id),
              success ? "completed" : "failed");
+    if (!media_base_url_.empty()) media_request_status_.store(success ? 2 : 3);
     pending_media_url_.clear();
     media_base_url_.clear();
     media_resume_ms_ = 0;

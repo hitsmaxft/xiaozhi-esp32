@@ -1,10 +1,10 @@
 #include "device_use_wifi.h"
 
-#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <climits>
 #include <string>
+#include <utility>
 
 #include <esp_log.h>
 #include <esp_random.h>
@@ -80,6 +80,28 @@ const char* Expression(uint32_t scene_id) {
 bool Integer(const cJSON* value, int min, int max) {
     return cJSON_IsNumber(value) && value->valuedouble >= min &&
            value->valuedouble <= max && value->valuedouble == value->valueint;
+}
+
+bool CallId(const char* id) {
+    if (!id) return false;
+    const size_t length = strlen(id);
+    if (length == 0 || length > 48) return false;
+    for (size_t i = 0; i < length; ++i) {
+        const char c = id[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == ':')) return false;
+    }
+    return true;
+}
+
+uint32_t ArgumentsCrc(const char* tool, const cJSON* args) {
+    char* encoded = cJSON_PrintUnformatted(args);
+    if (!encoded) return 0;
+    std::string canonical(tool);
+    canonical.push_back('\n');
+    canonical += encoded;
+    cJSON_free(encoded);
+    return Crc32(reinterpret_cast<const uint8_t*>(canonical.data()), canonical.size());
 }
 
 bool DecodeBitmap(const char* encoded, size_t expected, std::vector<uint8_t>& output) {
@@ -159,6 +181,8 @@ bool DeviceUseWifi::Connect() {
     receive_.clear();
     authorized_ = false;
     subscribed_ = false;
+    ++connection_epoch_;
+    if (connection_epoch_ == 0) ++connection_epoch_;
     cJSON* hello = cJSON_CreateObject();
     cJSON_AddStringToObject(hello, "jsonrpc", "2.0");
     cJSON_AddNumberToObject(hello, "id", 1);
@@ -167,6 +191,8 @@ bool DeviceUseWifi::Connect() {
     cJSON_AddStringToObject(params, "token", RLCD_DEVICE_USE_TOKEN);
     cJSON_AddStringToObject(params, "board", "waveshare-esp32-s3-rlcd-4.2");
     cJSON_AddNumberToObject(params, "bootId", boot_id_);
+    cJSON_AddNumberToObject(params, "connectionEpoch", connection_epoch_);
+    cJSON_AddNumberToObject(params, "lastEventSeq", event_seq_);
     bool sent = SendJson(hello);
     cJSON_Delete(hello);
     if (!sent) Disconnect();
@@ -261,6 +287,7 @@ void DeviceUseWifi::StateNotice() {
 cJSON* DeviceUseWifi::StateSnapshot() const {
     cJSON* state = cJSON_CreateObject();
     cJSON_AddNumberToObject(state, "bootId", boot_id_);
+    cJSON_AddNumberToObject(state, "hostSessionId", host_session_id_);
     cJSON_AddNumberToObject(state, "nowMs", NowMs());
     cJSON_AddNumberToObject(state, "revision", revision_);
     cJSON_AddNumberToObject(state, "seq", event_seq_);
@@ -296,13 +323,92 @@ void DeviceUseWifi::Reply(int id, cJSON* result, const char* error) {
     cJSON_Delete(response);
 }
 
-bool DeviceUseWifi::WasSeen(uint32_t operation_id) {
-    if (std::find(recent_ids_.begin(), recent_ids_.end(), operation_id) != recent_ids_.end()) {
-        return true;
+DeviceUseWifi::CallRecord* DeviceUseWifi::FindCall(const char* id) {
+    if (!id) return nullptr;
+    for (auto& call : calls_) if (call.id == id) return &call;
+    return nullptr;
+}
+
+DeviceUseWifi::CallRecord* DeviceUseWifi::ReserveCall(const char* id, const char* parent_id,
+        const char* tool, const char* scope, uint16_t generation, uint32_t argument_crc,
+        uint32_t operation_id) {
+    if (!id) return nullptr;
+    for (size_t offset = 0; offset < calls_.size(); ++offset) {
+        const size_t slot = (call_next_ + offset) % calls_.size();
+        auto& call = calls_[slot];
+        if (!call.id.empty() && strcmp(call.state, "accepted") == 0) continue;
+        call.id = id;
+        call.parent_id = parent_id ? parent_id : "";
+        call.tool = tool;
+        call.scope = scope;
+        call.argument_crc = argument_crc;
+        call.operation_id = operation_id;
+        call.generation = generation;
+        call.invocation_generation = generation;
+        call.state = "accepted";
+        call_next_ = (slot + 1) % calls_.size();
+        return &call;
     }
-    recent_ids_[recent_next_] = operation_id;
-    recent_next_ = (recent_next_ + 1) % recent_ids_.size();
-    return false;
+    return nullptr;
+}
+
+cJSON* DeviceUseWifi::CallSnapshot(const CallRecord& call) const {
+    cJSON* result = cJSON_CreateObject();
+    cJSON_AddStringToObject(result, "callId", call.id.c_str());
+    if (!call.parent_id.empty()) cJSON_AddStringToObject(result, "parentId", call.parent_id.c_str());
+    cJSON_AddStringToObject(result, "tool", call.tool.c_str());
+    cJSON_AddStringToObject(result, "scope", call.scope.c_str());
+    cJSON_AddStringToObject(result, "state", call.state);
+    cJSON_AddNumberToObject(result, "generation", call.generation);
+    cJSON_AddNumberToObject(result, "operationId", call.operation_id);
+    return result;
+}
+
+void DeviceUseWifi::FinishCall(uint32_t operation_id, bool success) {
+    for (auto& call : calls_) {
+        if (call.operation_id == operation_id && strcmp(call.state, "accepted") == 0) {
+            call.state = success ? "completed" : "failed";
+            return;
+        }
+    }
+}
+
+bool DeviceUseWifi::CompleteCall(CallRecord& call) {
+    if (strcmp(call.state, "accepted") != 0) return false;
+    call.state = "completed";
+    ++revision_;
+    Event(2, call.operation_id, 0);
+    for (auto& child : calls_) {
+        if (child.parent_id == call.id && child.scope == "CALL") CancelCall(child);
+    }
+    StateNotice();
+    return true;
+}
+
+bool DeviceUseWifi::CancelCall(CallRecord& call) {
+    if (strcmp(call.state, "accepted") != 0) return false;
+    ++call.generation;
+    call.state = "canceled";
+    if (call.tool == "screen.render" || call.tool == "screen.bitmap") {
+        screen_cancelled_.store(call.operation_id);
+        if (call.tool == "screen.bitmap" && bitmap_operation_id_ == call.operation_id) {
+            const uint32_t scene_id = scene_id_;
+            Application::GetInstance().Schedule([scene_id]() {
+                RlcdDisplay()->SetEmotion(Expression(scene_id));
+            });
+        }
+    } else if (call.tool == "media.play" && media_operation_id_ == call.operation_id) {
+        Application::GetInstance().StopMedia();
+        media_queued_ = false;
+        media_operation_id_ = 0;
+    }
+    ++revision_;
+    Event(3, call.operation_id, call.generation);
+    StateNotice();
+    for (auto& child : calls_) {
+        if (child.parent_id == call.id && child.scope == "CALL") CancelCall(child);
+    }
+    return true;
 }
 
 void DeviceUseWifi::HandleMessage(cJSON* message) {
@@ -312,16 +418,14 @@ void DeviceUseWifi::HandleMessage(cJSON* message) {
         const cJSON* accepted = cJSON_GetObjectItem(result, "accepted");
         const cJSON* wire_version = cJSON_GetObjectItem(result, "wireVersion");
         const cJSON* session_id = cJSON_GetObjectItem(result, "sessionId");
+        const cJSON* epoch = cJSON_GetObjectItem(result, "connectionEpoch");
         if (!Integer(id, 1, 1) || !cJSON_IsTrue(accepted) ||
-            !Integer(wire_version, 2, 2) || !Integer(session_id, 1, INT32_MAX)) {
+            !Integer(wire_version, 3, 3) || !Integer(session_id, 1, INT32_MAX) ||
+            !Integer(epoch, 1, INT32_MAX) || epoch->valueint != connection_epoch_) {
             Disconnect();
             return;
         }
-        if (host_session_id_ != static_cast<uint32_t>(session_id->valueint)) {
-            recent_ids_.fill(0);
-            recent_next_ = 0;
-            host_session_id_ = session_id->valueint;
-        }
+        host_session_id_ = session_id->valueint;
         authorized_ = true;
         Event(13, 0, 1);
         StateNotice();
@@ -334,7 +438,7 @@ void DeviceUseWifi::HandleMessage(cJSON* message) {
     const cJSON* params = cJSON_GetObjectItem(message, "params");
     const char* name = method->valuestring;
     if (strcmp(name, "initialize") == 0) {
-        Reply(request_id, ParseLiteral(R"({"name":"s3-rlcd-device-agent","protocolVersion":"device-use/0.2","wireVersion":2,"capabilities":{"tools":true,"resources":true,"subscribe":true,"prompts":true,"compactNotifications":true}})"));
+        Reply(request_id, ParseLiteral(R"({"name":"s3-rlcd-device-agent","protocolVersion":"device-use/0.3","wireVersion":3,"capabilities":{"tools":true,"resources":true,"subscribe":true,"prompts":true,"compactNotifications":true,"calls":true}})"));
     } else if (strcmp(name, "prompts/list") == 0) {
         Reply(request_id, ParseLiteral(R"({"prompts":[{"name":"device.capabilities","description":"RLCD actions and parameters"}]})"));
     } else if (strcmp(name, "prompts/get") == 0) {
@@ -364,6 +468,85 @@ void DeviceUseWifi::HandleMessage(cJSON* message) {
         cJSON_AddBoolToObject(result, "subscribed", true);
         cJSON_AddItemToObject(result, "snapshot", StateSnapshot());
         Reply(request_id, result);
+    } else if (strcmp(name, "calls/create") == 0) {
+        const cJSON* call_id = cJSON_GetObjectItem(params, "callId");
+        const cJSON* parent_id = cJSON_GetObjectItem(params, "parentId");
+        const cJSON* scope = cJSON_GetObjectItem(params, "scope");
+        const cJSON* generation = cJSON_GetObjectItem(params, "generation");
+        if (!cJSON_IsString(call_id) || !CallId(call_id->valuestring) ||
+            !cJSON_IsString(scope) || strcmp(scope->valuestring, "CALL") != 0 ||
+            !Integer(generation, 1, UINT16_MAX - 1) ||
+            (parent_id && (!cJSON_IsString(parent_id) || !CallId(parent_id->valuestring)))) {
+            Reply(request_id, nullptr, "invalid call metadata");
+            return;
+        }
+        if (CallRecord* existing = FindCall(call_id->valuestring)) {
+            if (existing->tool != "agent.turn" || existing->scope != "CALL" ||
+                existing->parent_id != (parent_id ? parent_id->valuestring : "") ||
+                existing->invocation_generation != generation->valueint) {
+                Reply(request_id, nullptr, "callId reused with different operation");
+            } else Reply(request_id, CallSnapshot(*existing));
+            return;
+        }
+        if (parent_id) {
+            CallRecord* parent = FindCall(parent_id->valuestring);
+            if (!parent || strcmp(parent->state, "accepted") != 0) {
+                Reply(request_id, nullptr, "parent call is not active");
+                return;
+            }
+        }
+        uint32_t operation_id = ++next_operation_id_;
+        if (operation_id == 0) operation_id = ++next_operation_id_;
+        CallRecord* call = ReserveCall(call_id->valuestring,
+            parent_id ? parent_id->valuestring : nullptr, "agent.turn", "CALL",
+            generation->valueint, 0, operation_id);
+        if (!call) Reply(request_id, nullptr, "call table full");
+        else {
+            ++revision_;
+            Reply(request_id, CallSnapshot(*call));
+            Event(1, operation_id, 0);
+            StateNotice();
+        }
+    } else if (strcmp(name, "calls/complete") == 0) {
+        const cJSON* call_id = cJSON_GetObjectItem(params, "callId");
+        const cJSON* generation = cJSON_GetObjectItem(params, "generation");
+        CallRecord* call = cJSON_IsString(call_id) ? FindCall(call_id->valuestring) : nullptr;
+        if (!call || call->tool != "agent.turn" ||
+            !Integer(generation, 1, UINT16_MAX - 1) ||
+            call->generation != generation->valueint) {
+            Reply(request_id, nullptr, "unknown call or stale generation");
+            return;
+        }
+        CompleteCall(*call);
+        Reply(request_id, CallSnapshot(*call));
+    } else if (strcmp(name, "calls/read") == 0) {
+        const cJSON* call_id = cJSON_GetObjectItem(params, "callId");
+        CallRecord* call = cJSON_IsString(call_id) ? FindCall(call_id->valuestring) : nullptr;
+        if (!call) Reply(request_id, nullptr, "unknown call; reconcile device state");
+        else Reply(request_id, CallSnapshot(*call));
+    } else if (strcmp(name, "calls/active") == 0) {
+        cJSON* result = cJSON_CreateObject();
+        cJSON* calls = cJSON_AddArrayToObject(result, "calls");
+        for (const auto& call : calls_) {
+            if (!call.id.empty() && strcmp(call.state, "accepted") == 0)
+                cJSON_AddItemToArray(calls, CallSnapshot(call));
+        }
+        cJSON_AddNumberToObject(result, "bootId", boot_id_);
+        cJSON_AddNumberToObject(result, "revision", revision_);
+        Reply(request_id, result);
+    } else if (strcmp(name, "calls/cancel") == 0) {
+        const cJSON* call_id = cJSON_GetObjectItem(params, "callId");
+        const cJSON* generation = cJSON_GetObjectItem(params, "generation");
+        CallRecord* call = cJSON_IsString(call_id) ? FindCall(call_id->valuestring) : nullptr;
+        if (!call || !Integer(generation, 1, UINT16_MAX - 1) ||
+            (call->generation != generation->valueint &&
+             !(strcmp(call->state, "canceled") == 0 &&
+               call->generation == generation->valueint + 1))) {
+            Reply(request_id, nullptr, "unknown call or stale generation");
+            return;
+        }
+        CancelCall(*call);
+        Reply(request_id, CallSnapshot(*call));
     } else if (strcmp(name, "tools/call") == 0) {
         const cJSON* tool = cJSON_GetObjectItem(params, "name");
         const cJSON* args = cJSON_GetObjectItem(params, "arguments");
@@ -371,32 +554,83 @@ void DeviceUseWifi::HandleMessage(cJSON* message) {
             Reply(request_id, nullptr, "missing tool name");
             return;
         }
-        uint32_t operation_id = static_cast<uint32_t>(request_id);
-        if (std::find(recent_ids_.begin(), recent_ids_.end(), operation_id) != recent_ids_.end()) {
-            cJSON* result = cJSON_CreateObject();
+        const cJSON* metadata = cJSON_GetObjectItem(params, "call");
+        const cJSON* call_id = cJSON_GetObjectItem(metadata, "callId");
+        const cJSON* parent_id = cJSON_GetObjectItem(metadata, "parentId");
+        const cJSON* scope = cJSON_GetObjectItem(metadata, "scope");
+        const cJSON* generation = cJSON_GetObjectItem(metadata, "generation");
+        if (!cJSON_IsObject(metadata) || !cJSON_IsString(call_id) ||
+            !CallId(call_id->valuestring) || !cJSON_IsString(scope) ||
+            (strcmp(scope->valuestring, "CALL") != 0 &&
+             strcmp(scope->valuestring, "SESSION") != 0 &&
+             strcmp(scope->valuestring, "DEVICE") != 0) ||
+            !Integer(generation, 1, UINT16_MAX - 1) ||
+            (parent_id && (!cJSON_IsString(parent_id) || !CallId(parent_id->valuestring))) ||
+            !cJSON_IsObject(args)) {
+            Reply(request_id, nullptr, "invalid call metadata");
+            return;
+        }
+        const uint32_t argument_crc = ArgumentsCrc(tool->valuestring, args);
+        if (CallRecord* previous = FindCall(call_id->valuestring)) {
+            if (previous->tool != tool->valuestring || previous->scope != scope->valuestring ||
+                previous->parent_id != (parent_id ? parent_id->valuestring : "") ||
+                previous->argument_crc != argument_crc ||
+                previous->invocation_generation != generation->valueint) {
+                Reply(request_id, nullptr, "callId reused with different operation");
+                return;
+            }
+            cJSON* result = CallSnapshot(*previous);
             cJSON_AddBoolToObject(result, "accepted", true);
             cJSON_AddBoolToObject(result, "duplicate", true);
-            cJSON_AddNumberToObject(result, "operationId", operation_id);
             Reply(request_id, result);
             return;
         }
+        if (parent_id) {
+            CallRecord* parent = FindCall(parent_id->valuestring);
+            if (!parent || strcmp(parent->state, "accepted") != 0) {
+                Reply(request_id, nullptr, "parent call is not active");
+                return;
+            }
+        }
+        if (((strcmp(tool->valuestring, "media.play") == 0 ||
+              strcmp(tool->valuestring, "screen.bitmap") == 0) &&
+             strcmp(scope->valuestring, "SESSION") != 0) ||
+            (strcmp(tool->valuestring, "media.play") != 0 &&
+             strcmp(tool->valuestring, "screen.bitmap") != 0 &&
+             strcmp(scope->valuestring, "CALL") != 0)) {
+            Reply(request_id, nullptr, "invalid scope for tool");
+            return;
+        }
+        uint32_t operation_id = ++next_operation_id_;
+        if (operation_id == 0) operation_id = ++next_operation_id_;
+        auto reserve = [&]() -> CallRecord* {
+            return ReserveCall(call_id->valuestring,
+                parent_id ? parent_id->valuestring : nullptr, tool->valuestring,
+                scope->valuestring, generation->valueint, argument_crc, operation_id);
+        };
         if (strcmp(tool->valuestring, "screen.render") == 0) {
             const cJSON* scene = cJSON_GetObjectItem(args, "sceneId");
             if (!Integer(scene, 1, 4) || screen_pending_.load() != 0) {
                 Reply(request_id, nullptr, "invalid scene or screen busy");
                 return;
             }
+            CallRecord* call = reserve();
+            if (!call) { Reply(request_id, nullptr, "call table full"); return; }
             screen_pending_.store(operation_id);
             const uint32_t scene_id = scene->valueint;
             Application::GetInstance().Schedule([this, operation_id, scene_id]() {
-                Board::GetInstance().GetDisplay()->SetEmotion(Expression(scene_id));
-                screen_done_scene_.store(scene_id);
+                if (screen_cancelled_.load() == operation_id) {
+                    screen_done_scene_.store(UINT32_MAX);
+                } else {
+                    Board::GetInstance().GetDisplay()->SetEmotion(Expression(scene_id));
+                    screen_done_scene_.store(scene_id);
+                }
                 screen_done_.store(operation_id);
             });
-            WasSeen(operation_id);
             cJSON* result = cJSON_CreateObject();
             cJSON_AddBoolToObject(result, "accepted", true);
             cJSON_AddNumberToObject(result, "operationId", operation_id);
+            cJSON_AddItemToObject(result, "call", CallSnapshot(*call));
             Reply(request_id, result);
             Event(1, operation_id, 0);
         } else if (strcmp(tool->valuestring, "screen.bitmap") == 0) {
@@ -416,6 +650,8 @@ void DeviceUseWifi::HandleMessage(cJSON* message) {
                 Reply(request_id, nullptr, "invalid bitmap data");
                 return;
             }
+            CallRecord* call = reserve();
+            if (!call) { Reply(request_id, nullptr, "call table full"); return; }
             screen_pending_.store(operation_id);
             const uint16_t bitmap_width = width->valueint;
             const uint16_t bitmap_height = height->valueint;
@@ -423,45 +659,62 @@ void DeviceUseWifi::HandleMessage(cJSON* message) {
             Application::GetInstance().Schedule(
                 [this, operation_id, bitmap_width, bitmap_height, duration_ms,
                  bits = std::move(bits)]() {
-                    bool shown = RlcdDisplay()->ShowTemporaryBitmap(bits, bitmap_width,
-                                                                    bitmap_height, duration_ms);
+                    bool shown = screen_cancelled_.load() != operation_id &&
+                        RlcdDisplay()->ShowTemporaryBitmap(bits, bitmap_width,
+                                                           bitmap_height, duration_ms);
                     screen_done_scene_.store(shown ? 0 : UINT32_MAX);
                     screen_done_.store(operation_id);
                 });
             bitmap_width_ = bitmap_width;
             bitmap_height_ = bitmap_height;
             bitmap_duration_ms_ = duration_ms;
-            WasSeen(operation_id);
             cJSON* result = cJSON_CreateObject();
             cJSON_AddBoolToObject(result, "accepted", true);
             cJSON_AddNumberToObject(result, "operationId", operation_id);
+            cJSON_AddItemToObject(result, "call", CallSnapshot(*call));
             Reply(request_id, result);
             Event(1, operation_id, 0);
         } else if (strcmp(tool->valuestring, "media.play") == 0) {
             const cJSON* url = cJSON_GetObjectItem(args, "url");
             if (!cJSON_IsString(url) || strlen(url->valuestring) > 1024 ||
-                !Application::GetInstance().QueueMedia(url->valuestring)) {
+                (strncmp(url->valuestring, "http://", 7) != 0 &&
+                 strncmp(url->valuestring, "https://", 8) != 0) ||
+                !strstr(url->valuestring, "/media/opus/")) {
                 Reply(request_id, nullptr, "invalid Opus media URL");
                 return;
             }
+            CallRecord* call = reserve();
+            if (!call) { Reply(request_id, nullptr, "call table full"); return; }
+            if (media_operation_id_ != 0) FinishCall(media_operation_id_, true);
+            if (!Application::GetInstance().QueueMedia(url->valuestring)) {
+                call->state = "failed";
+                Reply(request_id, nullptr, "media queue failed");
+                return;
+            }
+            media_operation_id_ = operation_id;
             media_queued_ = true;
             ++revision_;
-            WasSeen(operation_id);
             cJSON* result = cJSON_CreateObject();
             cJSON_AddBoolToObject(result, "accepted", true);
             cJSON_AddNumberToObject(result, "operationId", operation_id);
+            cJSON_AddItemToObject(result, "call", CallSnapshot(*call));
             Reply(request_id, result);
             Event(1, operation_id, 0);
             Event(2, operation_id, 0);
             StateNotice();
         } else if (strcmp(tool->valuestring, "media.stop") == 0) {
+            CallRecord* call = reserve();
+            if (!call) { Reply(request_id, nullptr, "call table full"); return; }
             Application::GetInstance().StopMedia();
+            if (media_operation_id_ != 0) FinishCall(media_operation_id_, true);
+            media_operation_id_ = 0;
+            call->state = "completed";
             media_queued_ = false;
             ++revision_;
-            WasSeen(operation_id);
             cJSON* result = cJSON_CreateObject();
             cJSON_AddBoolToObject(result, "accepted", true);
             cJSON_AddNumberToObject(result, "operationId", operation_id);
+            cJSON_AddItemToObject(result, "call", CallSnapshot(*call));
             Reply(request_id, result);
             Event(1, operation_id, 0);
             Event(2, operation_id, 0);
@@ -531,8 +784,17 @@ void DeviceUseWifi::Run() {
             uint32_t done = authorized_ ? screen_done_.exchange(0) : 0;
             if (done != 0) {
                 const uint32_t scene = screen_done_scene_.load();
+                CallRecord* completed_call = nullptr;
+                for (auto& call : calls_) {
+                    if (call.operation_id == done) { completed_call = &call; break; }
+                }
+                if (completed_call && strcmp(completed_call->state, "canceled") == 0) {
+                    screen_pending_.store(0);
+                    continue;
+                }
                 ++revision_;
                 if (scene == UINT32_MAX) {
+                    FinishCall(done, false);
                     Event(3, done, 0);
                 } else {
                     if (scene != 0) scene_id_ = scene;
@@ -542,6 +804,7 @@ void DeviceUseWifi::Run() {
                         bitmap_was_active_ = true;
                         bitmap_expires_at_ms_ = NowMs() + bitmap_duration_ms_;
                     }
+                    if (scene != 0) FinishCall(done, true);
                     Event(2, done, scene);
                     Event(4, done, scene);
                 }
@@ -550,9 +813,22 @@ void DeviceUseWifi::Run() {
             }
             if (bitmap_was_active_ && !RlcdDisplay()->TemporaryBitmapActive()) {
                 bitmap_was_active_ = false;
+                FinishCall(bitmap_operation_id_, true);
                 ++revision_;
                 Event(14, bitmap_operation_id_, 0);
                 StateNotice();
+            }
+            if (authorized_ && media_queued_ && media_operation_id_ != 0) {
+                const uint8_t media_status = Application::GetInstance().MediaRequestStatus();
+                if (media_status == 2 || media_status == 3) {
+                    const uint32_t completed = media_operation_id_;
+                    media_operation_id_ = 0;
+                    media_queued_ = false;
+                    FinishCall(completed, media_status == 2);
+                    ++revision_;
+                    Event(media_status == 2 ? 12 : 3, completed, 0);
+                    StateNotice();
+                }
             }
             uint8_t buffer[512];
             int received = recv(socket_, buffer, sizeof(buffer), 0);

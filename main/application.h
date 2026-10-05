@@ -7,6 +7,7 @@
 #include <esp_timer.h>
 
 #include <string>
+#include <atomic>
 #include <mutex>
 #include <deque>
 #include <memory>
@@ -120,6 +121,8 @@ public:
     // Safe to call from an MCP task; playback is serialized on the main task.
     bool QueueMedia(std::string url);
     void StopMedia();
+    // 0 = no request, 1 = queued/playing/paused, 2 = finished, 3 = failed.
+    uint8_t MediaRequestStatus() const { return media_request_status_.load(); }
     AudioService& GetAudioService() { return audio_service_; }
     
     /**
@@ -148,6 +151,7 @@ private:
     std::string media_base_url_;
     std::string pending_media_url_;
     uint32_t media_resume_ms_ = 0;
+    std::atomic<uint8_t> media_request_status_{0};
     std::unique_ptr<Ota> ota_;
 
     std::function<void(const std::string&)> mcp_broadcast_callback_;
