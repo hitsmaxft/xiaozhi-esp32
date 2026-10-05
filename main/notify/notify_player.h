@@ -32,6 +32,7 @@ public:
     void OnPlaybackDrained();
     bool IsActive(uint32_t playback_id = 0) const;
     bool IsBusy() const;
+    uint32_t LastPlaybackPositionMs() const;
 
 private:
     AudioService& audio_service_;

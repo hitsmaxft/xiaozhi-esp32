@@ -95,6 +95,11 @@ bool NotifyPlayer::IsBusy() const {
     return active_ || worker_running_;
 }
 
+uint32_t NotifyPlayer::LastPlaybackPositionMs() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_playback_position_ms_;
+}
+
 bool NotifyPlayer::IsCancelled(uint32_t playback_id) const {
     std::lock_guard<std::mutex> lock(mutex_);
     return cancelled_ || !active_ || playback_id != playback_id_;

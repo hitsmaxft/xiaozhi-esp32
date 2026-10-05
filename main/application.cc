@@ -273,6 +273,7 @@ void Application::Run() {
 
         if (bits & MAIN_EVENT_CLOCK_TICK) {
             clock_ticks_++;
+            MaybeStartPendingMedia();
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
 
@@ -781,7 +782,7 @@ void Application::HandleToggleChatEvent() {
     auto state = GetDeviceState();
 
     if (state == kDeviceStateNotifying) {
-        StopNotification();
+        PauseMediaForConversation();
         state = kDeviceStateIdle;
     }
 
@@ -805,7 +806,7 @@ void Application::HandleToggleChatEvent() {
 
     if (state == kDeviceStateIdle) {
         ListeningMode mode = GetDefaultListeningMode();
-        if (!protocol_->IsAudioChannelOpened()) {
+        if (!last_error_message_.empty() || !protocol_->IsAudioChannelOpened()) {
             SetDeviceState(kDeviceStateConnecting);
             // Schedule to let the state change be processed first (UI update)
             Schedule([this, mode]() { ContinueOpenAudioChannel(mode); });
@@ -829,7 +830,7 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
     auto& board = Board::GetInstance();
     board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
 
-    if (!protocol_->IsAudioChannelOpened()) {
+    if (!last_error_message_.empty() || !protocol_->IsAudioChannelOpened()) {
         if (!protocol_->OpenAudioChannel()) {
             // Return to idle so the device is not stuck in the connecting
             // state (not every failure path reports a network error)
@@ -845,7 +846,7 @@ void Application::HandleStartListeningEvent() {
     auto state = GetDeviceState();
 
     if (state == kDeviceStateNotifying) {
-        StopNotification();
+        PauseMediaForConversation();
         state = kDeviceStateIdle;
     }
 
@@ -906,7 +907,7 @@ void Application::HandleWakeWordDetectedEvent() {
     if (state == kDeviceStateIdle) {
         BeginWakeWordInvoke(wake_word);
     } else if (state == kDeviceStateNotifying) {
-        StopNotification();
+        PauseMediaForConversation();
         BeginWakeWordInvoke(wake_word);
     } else if (state == kDeviceStateSpeaking || state == kDeviceStateListening) {
         AbortSpeaking(kAbortReasonWakeWordDetected);
@@ -1018,6 +1019,7 @@ void Application::HandleStateChangedEvent() {
             }
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(true);
+            MaybeStartPendingMedia();
             break;
         case kDeviceStateConnecting:
             display->SetStatus(Lang::Strings::CONNECTING);
@@ -1144,6 +1146,58 @@ void Application::StartNotification(std::string audio_url, std::vector<NotifySub
     }
 }
 
+bool Application::QueueMedia(std::string url) {
+    if (url.size() > 1024 ||
+        (url.compare(0, 7, "http://") != 0 && url.compare(0, 8, "https://") != 0) ||
+        url.find("/media/opus/") == std::string::npos) {
+        return false;
+    }
+    Schedule([this, url = std::move(url)]() {
+        if (GetDeviceState() == kDeviceStateNotifying) {
+            StopNotification();
+        }
+        media_base_url_ = url;
+        media_resume_ms_ = 0;
+        pending_media_url_ = url;
+        MaybeStartPendingMedia();
+    });
+    return true;
+}
+
+void Application::StopMedia() {
+    Schedule([this]() {
+        pending_media_url_.clear();
+        media_base_url_.clear();
+        media_resume_ms_ = 0;
+        if (GetDeviceState() == kDeviceStateNotifying) {
+            StopNotification();
+        }
+    });
+}
+
+void Application::PauseMediaForConversation() {
+    if (!media_base_url_.empty() && GetDeviceState() == kDeviceStateNotifying) {
+        media_resume_ms_ = std::min<uint32_t>(3600000,
+            media_resume_ms_ + notify_player_.LastPlaybackPositionMs());
+        pending_media_url_ = media_base_url_;
+    }
+    StopNotification();
+}
+
+void Application::MaybeStartPendingMedia() {
+    if (GetDeviceState() != kDeviceStateIdle || pending_media_url_.empty() ||
+        notify_player_.IsBusy() || !protocol_ || protocol_->IsAudioChannelOpened()) {
+        return;
+    }
+    std::string url = std::move(pending_media_url_);
+    pending_media_url_.clear();
+    if (media_resume_ms_ > 0) {
+        url += (url.find('?') == std::string::npos ? "?" : "&");
+        url += "start_ms=" + std::to_string(media_resume_ms_);
+    }
+    StartNotification(std::move(url), {});
+}
+
 void Application::StopNotification() {
     notify_player_.Stop();
     audio_service_.ResetDecoder();
@@ -1161,6 +1215,9 @@ void Application::HandleNotificationFinished(uint32_t playback_id, bool success)
     }
     ESP_LOGI(TAG, "Notification playback %lu %s", static_cast<unsigned long>(playback_id),
              success ? "completed" : "failed");
+    pending_media_url_.clear();
+    media_base_url_.clear();
+    media_resume_ms_ = 0;
     StopNotification();
 }
 
@@ -1282,7 +1339,7 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
     } else if (state == kDeviceStateNotifying) {
         Schedule([this, wake_word]() {
             if (GetDeviceState() == kDeviceStateNotifying) {
-                StopNotification();
+                PauseMediaForConversation();
                 BeginWakeWordInvoke(wake_word);
             }
         });

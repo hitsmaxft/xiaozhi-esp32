@@ -117,6 +117,9 @@ public:
     void SetAecMode(AecMode mode);
     AecMode GetAecMode() const { return aec_mode_; }
     void PlaySound(const std::string_view& sound);
+    // Safe to call from an MCP task; playback is serialized on the main task.
+    bool QueueMedia(std::string url);
+    void StopMedia();
     AudioService& GetAudioService() { return audio_service_; }
     
     /**
@@ -142,6 +145,9 @@ private:
     AudioService audio_service_;
     NotifyPlayer notify_player_;
     uint32_t notification_playback_id_ = 0;
+    std::string media_base_url_;
+    std::string pending_media_url_;
+    uint32_t media_resume_ms_ = 0;
     std::unique_ptr<Ota> ota_;
 
     std::function<void(const std::string&)> mcp_broadcast_callback_;
@@ -168,6 +174,8 @@ private:
     void BeginWakeWordInvoke(const std::string& wake_word);
     void ContinueWakeWordInvoke(const std::string& wake_word);
     void StartListeningAudio();
+    void PauseMediaForConversation();
+    void MaybeStartPendingMedia();
     void ConfigureWakeWordForListening();
     void StartNotification(std::string audio_url, std::vector<NotifySubtitle> subtitles);
     void StopNotification();

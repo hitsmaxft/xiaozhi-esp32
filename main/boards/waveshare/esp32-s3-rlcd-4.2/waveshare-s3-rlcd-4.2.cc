@@ -3,6 +3,17 @@
 #include <driver/spi_common.h>
 #include <esp_log.h>
 #include "custom_lcd_display.h"
+#include "device_use_wifi.h"
+#include <ssid_manager.h>
+#include <esp_efuse.h>
+#include <esp_efuse_table.h>
+#include <esp_system.h>
+#include <soc/rtc_cntl_reg.h>
+#include <soc/soc.h>
+
+#if __has_include("local_config.h")
+#include "local_config.h"
+#endif
 #include "wifi_board.h"
 #include "application.h"
 #include "button.h"
@@ -16,6 +27,16 @@
 #define TAG "waveshare_rlcd_4_2"
 
 class CustomBoard : public WifiBoard {
+protected:
+    void ProvisionDefaultWifi() override {
+#if defined(RLCD_LOCAL_WIFI_SSID) && defined(RLCD_LOCAL_WIFI_PASSWORD)
+        auto& ssid_manager = SsidManager::GetInstance();
+        if (ssid_manager.GetSsidList().empty()) {
+            ssid_manager.AddSsid(RLCD_LOCAL_WIFI_SSID, RLCD_LOCAL_WIFI_PASSWORD);
+        }
+#endif
+    }
+
 private:
     i2c_master_bus_handle_t i2c_bus_;
     Button boot_button_;
@@ -64,6 +85,29 @@ private:
             EnterWifiConfigMode();
             return true;
         });
+
+#ifdef RLCD_RECOVERY_TOKEN
+        mcp_server.AddUserOnlyTool(
+            "self.system.enter_download_mode",
+            "Reboot this ESP32-S3 into ROM USB download mode for a physical flashing session",
+            PropertyList({Property("token", kPropertyTypeString).SetMaxLength(64)}),
+            [](const PropertyList& properties) -> ReturnValue {
+                const std::string token = properties["token"].value<std::string>();
+                if (token != RLCD_RECOVERY_TOKEN ||
+                    esp_efuse_read_field_bit(ESP_EFUSE_DIS_FORCE_DOWNLOAD) ||
+                    esp_efuse_read_field_bit(ESP_EFUSE_DIS_DOWNLOAD_MODE) ||
+                    esp_efuse_read_field_bit(ESP_EFUSE_DIS_USB_SERIAL_JTAG_DOWNLOAD_MODE)) {
+                    return false;
+                }
+                Application::GetInstance().Schedule([]() {
+                    ESP_LOGW(TAG, "Entering ROM USB download mode");
+                    vTaskDelay(pdMS_TO_TICKS(1000));
+                    REG_SET_BIT(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
+                    esp_restart();
+                });
+                return true;
+            });
+#endif
     }
 
     void InitializeLcdDisplay() {
@@ -135,6 +179,7 @@ public:
         InitializeButtons();     
         InitializeTools();
         InitializeLcdDisplay();
+        DeviceUseWifi::GetInstance().Start();
    }
 
     virtual AudioCodec* GetAudioCodec() override {

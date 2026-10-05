@@ -26,6 +26,9 @@ protected:
      */
     void TryWifiConnect();
 
+    /** Optional board default, applied after WiFi manager initialization. */
+    virtual void ProvisionDefaultWifi() {}
+
     /**
      * Enter WiFi configuration mode
      */

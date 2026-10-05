@@ -77,6 +77,13 @@ void WebsocketProtocol::CloseAudioChannel(bool send_goodbye) {
 }
 
 bool WebsocketProtocol::OpenAudioChannel() {
+    // A failed channel can still own a socket. Its close callback must not
+    // turn the new connection attempt back into idle.
+    if (websocket_ != nullptr) {
+        websocket_->OnDisconnected([]() {});
+        websocket_.reset();
+    }
+    xEventGroupClearBits(event_group_handle_, WEBSOCKET_PROTOCOL_SERVER_HELLO_EVENT);
     Settings settings("websocket", false);
     std::string url = settings.GetString("url");
     std::string token = settings.GetString("token");
@@ -187,6 +194,10 @@ bool WebsocketProtocol::OpenAudioChannel() {
         ESP_LOGE(TAG, "Failed to receive server hello");
         SetError(Lang::Strings::SERVER_TIMEOUT);
         return false;
+    }
+
+    if (on_connected_ != nullptr) {
+        on_connected_();
     }
 
     if (on_audio_channel_opened_ != nullptr) {

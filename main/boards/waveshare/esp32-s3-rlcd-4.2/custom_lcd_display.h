@@ -2,6 +2,9 @@
 #define __CUSTOM_LCD_DISPLAY_H__
 
 #include <driver/gpio.h>
+#include <atomic>
+#include <string>
+#include <vector>
 #include "lcd_display.h"
 
 enum ColorSelection {
@@ -19,6 +22,12 @@ typedef struct {
 
 class CustomLcdDisplay : public LcdDisplay {
 private:
+    lv_obj_t* temporary_bitmap_ = nullptr;
+    lv_timer_t* temporary_bitmap_timer_ = nullptr;
+    lv_img_dsc_t temporary_bitmap_image_{};
+    std::atomic<bool> temporary_bitmap_active_{false};
+    std::string current_emotion_;
+    void ClearTemporaryBitmapLocked();
     esp_lcd_panel_io_handle_t io_handle = NULL;
     uint32_t            i2c_data_pdMS_TICKS = 0;
     uint32_t            i2c_done_pdMS_TICKS = 0;
@@ -48,6 +57,10 @@ public:
                   int width, int height, int offset_x, int offset_y,
                   bool mirror_x, bool mirror_y, bool swap_xy,spi_display_config_t spiconfig,spi_host_device_t spi_host = SPI3_HOST);
     ~CustomLcdDisplay();
+    void SetEmotion(const char* emotion) override;
+    bool ShowTemporaryBitmap(const std::vector<uint8_t>& bits, int width, int height,
+                             uint32_t duration_ms);
+    bool TemporaryBitmapActive() const { return temporary_bitmap_active_.load(); }
     void RLCD_Init();
     void RLCD_ColorClear(uint8_t color);
     void RLCD_Display();

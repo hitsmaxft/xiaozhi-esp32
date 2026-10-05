@@ -27,6 +27,7 @@ dependencies:
   78/esp-ml307: ~3.7.3
   78/uart-uhci:
     version: ^0.3.3
+    override_path: ../local_components/78__uart-uhci
     rules:
     - if: target not in [esp32]
   78/uart-eth-modem:

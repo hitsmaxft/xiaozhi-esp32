@@ -116,6 +116,18 @@ void McpServer::AddCommonTools() {
     }
 #endif
 
+    AddTool("self.audio.play_stream",
+            "Play an Ogg/Opus stream from the local media service. Audio is queued until the current conversation ends and resumes after a later conversation.",
+            PropertyList({Property("url", kPropertyTypeString)}),
+            [](const PropertyList& properties) -> ReturnValue {
+                return Application::GetInstance().QueueMedia(properties["url"].value<std::string>());
+            });
+    AddTool("self.audio.stop_media", "Stop the current media stream and clear its resume position",
+            PropertyList(), [](const PropertyList&) -> ReturnValue {
+                Application::GetInstance().StopMedia();
+                return true;
+            });
+
     // Restore the original tools list to the end of the tools list
     tools_.insert(tools_.end(), std::make_move_iterator(original_tools.begin()),
                   std::make_move_iterator(original_tools.end()));
@@ -262,12 +274,20 @@ void McpServer::AddUserOnlyTools() {
                 return true;
             });
 
-        AddUserOnlyTool(
-            "self.screen.preview_image", "Preview an image on the screen",
+#endif  // CONFIG_LV_USE_SNAPSHOT
+        AddTool(
+            "self.screen.preview_image", "Display a small image from an HTTP URL on the screen",
             PropertyList({Property("url", kPropertyTypeString)}),
             [display](const PropertyList& properties) -> ToolResult {
                 auto url = properties["url"].value<std::string>();
+                constexpr size_t kMaxImageBytes = 512 * 1024;
+                if (url.size() > 1024 ||
+                    (url.compare(0, 7, "http://") != 0 &&
+                     url.compare(0, 8, "https://") != 0)) {
+                    return std::unexpected("Image URL must be HTTP(S) and at most 1024 bytes");
+                }
                 auto http = Board::GetInstance().GetNetwork()->CreateHttp(3);
+                http->SetTimeout(5000);
 
                 if (auto opened = http->Open("GET", url); !opened) {
                     return std::unexpected("Failed to open URL: " + url + " (" +
@@ -283,9 +303,13 @@ void McpServer::AddUserOnlyTools() {
                 }
 
                 size_t content_length = http->GetBodyLength();
+                if (content_length == 0 || content_length > kMaxImageBytes) {
+                    http->Close();
+                    return std::unexpected("Image must have Content-Length of 1 to 524288 bytes");
+                }
                 using BufferPtr = std::unique_ptr<char, decltype(&heap_caps_free)>;
                 BufferPtr data(
-                    static_cast<char*>(heap_caps_malloc(content_length, MALLOC_CAP_8BIT)),
+                    static_cast<char*>(heap_caps_malloc(content_length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)),
                     heap_caps_free);
                 if (data == nullptr) {
                     return std::unexpected("Failed to allocate memory for image: " + url);
@@ -302,6 +326,9 @@ void McpServer::AddUserOnlyTools() {
                     total_read += *ret;
                 }
                 http->Close();
+                if (total_read != content_length) {
+                    return std::unexpected("Image download ended before Content-Length");
+                }
 
                 auto image = std::make_unique<LvglAllocatedImage>(data.release(), total_read);
                 if (!image->IsValid()) {
@@ -310,7 +337,6 @@ void McpServer::AddUserOnlyTools() {
                 display->SetPreviewImage(std::move(image));
                 return true;
             });
-#endif  // CONFIG_LV_USE_SNAPSHOT
     }
 #endif  // HAVE_LVGL
 

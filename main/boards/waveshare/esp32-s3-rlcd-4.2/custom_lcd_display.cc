@@ -4,6 +4,7 @@
 #include <esp_lcd_panel_io.h>
 #include <esp_log.h>
 #include <esp_err.h>
+#include <esp_heap_caps.h>
 #include "custom_lcd_display.h"
 #include "lcd_display.h"
 #include "esp_lvgl_port.h"
@@ -122,6 +123,84 @@ height_(height)
 }
 
 CustomLcdDisplay::~CustomLcdDisplay() {
+    DisplayLockGuard lock(this);
+    if (lock) ClearTemporaryBitmapLocked();
+}
+
+void CustomLcdDisplay::ClearTemporaryBitmapLocked() {
+    if (temporary_bitmap_timer_) {
+        lv_timer_delete(temporary_bitmap_timer_);
+        temporary_bitmap_timer_ = nullptr;
+    }
+    if (temporary_bitmap_) {
+        lv_obj_delete(temporary_bitmap_);
+        temporary_bitmap_ = nullptr;
+    }
+    if (temporary_bitmap_image_.data) {
+        heap_caps_free(const_cast<uint8_t*>(temporary_bitmap_image_.data));
+        temporary_bitmap_image_ = {};
+    }
+    temporary_bitmap_active_.store(false);
+}
+
+void CustomLcdDisplay::SetEmotion(const char* emotion) {
+    {
+        DisplayLockGuard lock(this);
+        if (lock && emotion && current_emotion_ != emotion) {
+            current_emotion_ = emotion;
+            ClearTemporaryBitmapLocked();
+        }
+    }
+    LcdDisplay::SetEmotion(emotion);
+}
+
+bool CustomLcdDisplay::ShowTemporaryBitmap(const std::vector<uint8_t>& bits, int width,
+                                            int height, uint32_t duration_ms) {
+    const size_t stride = (width + 7) / 8;
+    if (width < 1 || width > 160 || height < 1 || height > 120 ||
+        bits.size() != stride * height || duration_ms < 100 || duration_ms > 60000) {
+        return false;
+    }
+    auto pixels = static_cast<uint16_t*>(heap_caps_malloc(width * height * sizeof(uint16_t),
+                                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!pixels) return false;
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            pixels[y * width + x] = (bits[y * stride + x / 8] & (0x80 >> (x % 8)))
+                                          ? 0xffff : 0x0000;
+        }
+    }
+    DisplayLockGuard lock(this);
+    if (!lock) {
+        heap_caps_free(pixels);
+        return false;
+    }
+    ClearTemporaryBitmapLocked();
+    temporary_bitmap_image_.header.magic = LV_IMAGE_HEADER_MAGIC;
+    temporary_bitmap_image_.header.cf = LV_COLOR_FORMAT_RGB565;
+    temporary_bitmap_image_.header.w = width;
+    temporary_bitmap_image_.header.h = height;
+    temporary_bitmap_image_.header.stride = width * sizeof(uint16_t);
+    temporary_bitmap_image_.data_size = width * height * sizeof(uint16_t);
+    temporary_bitmap_image_.data = reinterpret_cast<uint8_t*>(pixels);
+    temporary_bitmap_ = lv_image_create(lv_screen_active());
+    if (!temporary_bitmap_) {
+        ClearTemporaryBitmapLocked();
+        return false;
+    }
+    lv_image_set_src(temporary_bitmap_, &temporary_bitmap_image_);
+    lv_obj_center(temporary_bitmap_);
+    lv_obj_move_foreground(temporary_bitmap_);
+    temporary_bitmap_timer_ = lv_timer_create([](lv_timer_t* timer) {
+        auto* display = static_cast<CustomLcdDisplay*>(lv_timer_get_user_data(timer));
+        display->ClearTemporaryBitmapLocked();
+    }, duration_ms, this);
+    if (!temporary_bitmap_timer_) {
+        ClearTemporaryBitmapLocked();
+        return false;
+    }
+    temporary_bitmap_active_.store(true);
+    return true;
 }
 
 void CustomLcdDisplay::InitPortraitLUT() {
