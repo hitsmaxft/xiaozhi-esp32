@@ -197,22 +197,18 @@ void CustomLcdDisplay::SetupUI() {
     lv_obj_set_style_border_side(top_bar_, LV_BORDER_SIDE_BOTTOM, 0);
     lv_obj_set_scrollbar_mode(top_bar_, LV_SCROLLBAR_MODE_OFF);
 
-    auto* brand = lv_label_create(top_bar_);
-    lv_label_set_text(brand, "AGENT / 01");
-    lv_obj_set_pos(brand, 14, 10);
-
     status_label_ = lv_label_create(top_bar_);
-    lv_obj_set_size(status_label_, 162, 28);
-    lv_obj_set_pos(status_label_, 127, 9);
+    lv_obj_set_size(status_label_, 276, 28);
+    lv_obj_set_pos(status_label_, 14, 9);
     lv_label_set_long_mode(status_label_, LV_LABEL_LONG_DOT);
-    lv_obj_set_style_text_align(status_label_, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_align(status_label_, LV_TEXT_ALIGN_LEFT, 0);
     lv_label_set_text(status_label_, "启动中");
 
     notification_label_ = lv_label_create(top_bar_);
-    lv_obj_set_size(notification_label_, 162, 28);
-    lv_obj_set_pos(notification_label_, 127, 9);
+    lv_obj_set_size(notification_label_, 276, 28);
+    lv_obj_set_pos(notification_label_, 14, 9);
     lv_label_set_long_mode(notification_label_, LV_LABEL_LONG_DOT);
-    lv_obj_set_style_text_align(notification_label_, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_align(notification_label_, LV_TEXT_ALIGN_LEFT, 0);
     lv_obj_add_flag(notification_label_, LV_OBJ_FLAG_HIDDEN);
 
     network_label_ = lv_label_create(top_bar_);
@@ -238,13 +234,9 @@ void CustomLcdDisplay::SetupUI() {
     lv_obj_set_style_border_width(agent_stage_, 2, 0);
     lv_obj_set_scrollbar_mode(agent_stage_, LV_SCROLLBAR_MODE_OFF);
 
-    auto* stage_caption = lv_label_create(agent_stage_);
-    lv_label_set_text(stage_caption, "DEVICE USE  /  LIVE");
-    lv_obj_set_pos(stage_caption, 14, 9);
-
     emoji_box_ = lv_obj_create(agent_stage_);
     lv_obj_set_size(emoji_box_, 180, 126);
-    lv_obj_align(emoji_box_, LV_ALIGN_CENTER, 0, 11);
+    lv_obj_align(emoji_box_, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_pad_all(emoji_box_, 0, 0);
     lv_obj_set_style_border_width(emoji_box_, 0, 0);
     lv_obj_set_style_bg_opa(emoji_box_, LV_OPA_TRANSP, 0);
@@ -276,7 +268,7 @@ void CustomLcdDisplay::SetupUI() {
     lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
 
     preview_image_ = lv_image_create(agent_stage_);
-    lv_obj_align(preview_image_, LV_ALIGN_CENTER, 0, 11);
+    lv_obj_align(preview_image_, LV_ALIGN_CENTER, 0, 0);
     lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
 
     bottom_bar_ = lv_obj_create(container_);
@@ -288,11 +280,9 @@ void CustomLcdDisplay::SetupUI() {
     lv_obj_set_style_border_side(bottom_bar_, LV_BORDER_SIDE_TOP, 0);
     lv_obj_set_scrollbar_mode(bottom_bar_, LV_SCROLLBAR_MODE_OFF);
 
-    role_label_ = lv_label_create(bottom_bar_);
-    lv_obj_set_pos(role_label_, 16, 5);
     chat_message_label_ = lv_label_create(bottom_bar_);
-    lv_obj_set_size(chat_message_label_, width_ - 32, 48);
-    lv_obj_set_pos(chat_message_label_, 16, 26);
+    lv_obj_set_size(chat_message_label_, width_ - 32, 56);
+    lv_obj_set_pos(chat_message_label_, 16, 10);
     lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_WRAP);
     UpdateConversationLocked();
 
@@ -320,7 +310,7 @@ void CustomLcdDisplay::ApplyPaletteLocked() {
         lv_obj_set_style_text_color(panel, ink, 0);
     }
     for (auto* label : {network_label_, status_label_, notification_label_, mute_label_,
-                        battery_label_, role_label_, chat_message_label_, emoji_label_}) {
+                        battery_label_, chat_message_label_, emoji_label_}) {
         if (label) lv_obj_set_style_text_color(label, ink, 0);
     }
     if (low_battery_popup_) {
@@ -380,23 +370,14 @@ void CustomLcdDisplay::DrawFaceLocked(const char* emotion) {
 }
 
 void CustomLcdDisplay::UpdateConversationLocked() {
-    if (!role_label_ || !chat_message_label_) return;
-    if (subtitles_hidden_) {
-        lv_label_set_text(role_label_, "DIALOGUE / HIDDEN");
-        lv_label_set_text(chat_message_label_, "字幕已隐藏");
-        return;
-    }
-    const char* role = chat_role_ == "user" ? "YOU" :
-                       chat_role_ == "assistant" ? "AGENT" : "SYSTEM";
-    lv_label_set_text(role_label_, role);
-    lv_label_set_text(chat_message_label_,
-                      chat_content_.empty() ? "按下按键开始对话" : chat_content_.c_str());
+    if (!chat_message_label_) return;
+    lv_label_set_text(chat_message_label_, subtitles_hidden_ ? "" : chat_content_.c_str());
 }
 
 void CustomLcdDisplay::SetChatMessage(const char* role, const char* content) {
     DisplayLockGuard lock(this);
     if (!lock) return;
-    chat_role_ = role ? role : "system";
+    (void)role;
     chat_content_ = content ? content : "";
     UpdateConversationLocked();
 }
@@ -437,7 +418,7 @@ void CustomLcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
                                256 * max_height / descriptor->header.h});
     lv_image_set_src(preview_image_, descriptor);
     lv_image_set_scale(preview_image_, scale);
-    lv_obj_align(preview_image_, LV_ALIGN_CENTER, 0, 11);
+    lv_obj_align(preview_image_, LV_ALIGN_CENTER, 0, 0);
     if (gif_controller_) gif_controller_->Stop();
     lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
@@ -523,7 +504,7 @@ bool CustomLcdDisplay::ShowTemporaryBitmap(const std::vector<uint8_t>& bits, int
         return false;
     }
     lv_image_set_src(temporary_bitmap_, &temporary_bitmap_image_);
-    lv_obj_align(temporary_bitmap_, LV_ALIGN_CENTER, 0, 11);
+    lv_obj_align(temporary_bitmap_, LV_ALIGN_CENTER, 0, 0);
     lv_obj_move_foreground(temporary_bitmap_);
     lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);

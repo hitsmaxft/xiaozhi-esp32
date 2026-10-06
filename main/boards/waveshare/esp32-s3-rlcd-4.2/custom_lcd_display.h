@@ -24,10 +24,8 @@ class CustomLcdDisplay : public LcdDisplay {
 private:
     lv_obj_t* agent_stage_ = nullptr;
     lv_obj_t* face_view_ = nullptr;
-    lv_obj_t* role_label_ = nullptr;
     uint16_t* face_pixels_ = nullptr;
     lv_img_dsc_t face_image_{};
-    std::string chat_role_ = "system";
     std::string chat_content_;
     bool subtitles_hidden_ = false;
     lv_obj_t* temporary_bitmap_ = nullptr;
