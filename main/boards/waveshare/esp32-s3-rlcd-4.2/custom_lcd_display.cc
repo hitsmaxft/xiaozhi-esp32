@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <vector>
 #include <cstring>
 #include <freertos/FreeRTOS.h>
@@ -12,6 +13,36 @@
 #include "settings.h"
 #include "config.h"
 #include "board.h"
+#include "lvgl_theme.h"
+#include <material_symbols.h>
+
+namespace {
+constexpr int kFaceWidth = 160;
+constexpr int kFaceHeight = 120;
+constexpr uint16_t kInk = 0x0000;
+constexpr uint16_t kPaper = 0xffff;
+
+void Plot(uint16_t* pixels, int x, int y, int radius = 0) {
+    for (int dy = -radius; dy <= radius; ++dy) {
+        for (int dx = -radius; dx <= radius; ++dx) {
+            if (dx * dx + dy * dy <= radius * radius) {
+                const int px = x + dx;
+                const int py = y + dy;
+                if (px >= 0 && px < kFaceWidth && py >= 0 && py < kFaceHeight) {
+                    pixels[py * kFaceWidth + px] = kInk;
+                }
+            }
+        }
+    }
+}
+
+bool IsFaceEmotion(const char* emotion) {
+    return emotion && (strcmp(emotion, "neutral") == 0 ||
+        strcmp(emotion, "robot_2") == 0 || strcmp(emotion, "happy") == 0 ||
+        strcmp(emotion, "sad") == 0 || strcmp(emotion, "surprised") == 0 ||
+        strcmp(emotion, "sleepy") == 0);
+}
+}
 
 void CustomLcdDisplay::Lvgl_flush_cb(lv_display_t * disp, const lv_area_t * area, uint8_t * color_p)
 {
@@ -124,7 +155,294 @@ height_(height)
 
 CustomLcdDisplay::~CustomLcdDisplay() {
     DisplayLockGuard lock(this);
-    if (lock) ClearTemporaryBitmapLocked();
+    if (lock) {
+        ClearTemporaryBitmapLocked();
+        if (face_view_) {
+            lv_obj_delete(face_view_);
+            face_view_ = nullptr;
+        }
+        if (face_pixels_) {
+            heap_caps_free(face_pixels_);
+            face_pixels_ = nullptr;
+        }
+    }
+}
+
+void CustomLcdDisplay::SetupUI() {
+    if (setup_ui_called_) return;
+    DisplayLockGuard lock(this);
+    if (!lock || setup_ui_called_) return;
+    Display::SetupUI();
+
+    auto* theme = static_cast<LvglTheme*>(current_theme_);
+    auto* text_font = theme->text_font()->font();
+    auto* icon_font = theme->icon_font()->font();
+    auto* screen = lv_screen_active();
+    lv_obj_set_style_text_font(screen, text_font, 0);
+
+    container_ = lv_obj_create(screen);
+    lv_obj_set_size(container_, width_, height_);
+    lv_obj_set_pos(container_, 0, 0);
+    lv_obj_set_style_pad_all(container_, 0, 0);
+    lv_obj_set_style_border_width(container_, 0, 0);
+    lv_obj_set_style_radius(container_, 0, 0);
+    lv_obj_set_scrollbar_mode(container_, LV_SCROLLBAR_MODE_OFF);
+
+    top_bar_ = lv_obj_create(container_);
+    lv_obj_set_size(top_bar_, width_, 43);
+    lv_obj_set_pos(top_bar_, 0, 0);
+    lv_obj_set_style_pad_all(top_bar_, 0, 0);
+    lv_obj_set_style_radius(top_bar_, 0, 0);
+    lv_obj_set_style_border_width(top_bar_, 2, 0);
+    lv_obj_set_style_border_side(top_bar_, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_scrollbar_mode(top_bar_, LV_SCROLLBAR_MODE_OFF);
+
+    auto* brand = lv_label_create(top_bar_);
+    lv_label_set_text(brand, "AGENT / 01");
+    lv_obj_set_pos(brand, 14, 10);
+
+    status_label_ = lv_label_create(top_bar_);
+    lv_obj_set_size(status_label_, 162, 28);
+    lv_obj_set_pos(status_label_, 127, 9);
+    lv_label_set_long_mode(status_label_, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(status_label_, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_text(status_label_, "启动中");
+
+    notification_label_ = lv_label_create(top_bar_);
+    lv_obj_set_size(notification_label_, 162, 28);
+    lv_obj_set_pos(notification_label_, 127, 9);
+    lv_label_set_long_mode(notification_label_, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(notification_label_, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_add_flag(notification_label_, LV_OBJ_FLAG_HIDDEN);
+
+    network_label_ = lv_label_create(top_bar_);
+    lv_obj_set_pos(network_label_, 302, 8);
+    lv_obj_set_style_text_font(network_label_, icon_font, 0);
+    lv_label_set_text(network_label_, "");
+
+    mute_label_ = lv_label_create(top_bar_);
+    lv_obj_set_pos(mute_label_, 330, 8);
+    lv_obj_set_style_text_font(mute_label_, icon_font, 0);
+    lv_label_set_text(mute_label_, "");
+
+    battery_label_ = lv_label_create(top_bar_);
+    lv_obj_set_pos(battery_label_, 361, 8);
+    lv_obj_set_style_text_font(battery_label_, icon_font, 0);
+    lv_label_set_text(battery_label_, "");
+
+    agent_stage_ = lv_obj_create(container_);
+    lv_obj_set_size(agent_stage_, width_ - 24, 166);
+    lv_obj_set_pos(agent_stage_, 12, 50);
+    lv_obj_set_style_pad_all(agent_stage_, 0, 0);
+    lv_obj_set_style_radius(agent_stage_, 12, 0);
+    lv_obj_set_style_border_width(agent_stage_, 2, 0);
+    lv_obj_set_scrollbar_mode(agent_stage_, LV_SCROLLBAR_MODE_OFF);
+
+    auto* stage_caption = lv_label_create(agent_stage_);
+    lv_label_set_text(stage_caption, "DEVICE USE  /  LIVE");
+    lv_obj_set_pos(stage_caption, 14, 9);
+
+    emoji_box_ = lv_obj_create(agent_stage_);
+    lv_obj_set_size(emoji_box_, 180, 126);
+    lv_obj_align(emoji_box_, LV_ALIGN_CENTER, 0, 11);
+    lv_obj_set_style_pad_all(emoji_box_, 0, 0);
+    lv_obj_set_style_border_width(emoji_box_, 0, 0);
+    lv_obj_set_style_bg_opa(emoji_box_, LV_OPA_TRANSP, 0);
+    lv_obj_set_scrollbar_mode(emoji_box_, LV_SCROLLBAR_MODE_OFF);
+
+    face_pixels_ = static_cast<uint16_t*>(heap_caps_malloc(
+        kFaceWidth * kFaceHeight * sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (face_pixels_) {
+        face_image_.header.magic = LV_IMAGE_HEADER_MAGIC;
+        face_image_.header.cf = LV_COLOR_FORMAT_RGB565;
+        face_image_.header.w = kFaceWidth;
+        face_image_.header.h = kFaceHeight;
+        face_image_.header.stride = kFaceWidth * sizeof(uint16_t);
+        face_image_.data_size = kFaceWidth * kFaceHeight * sizeof(uint16_t);
+        face_image_.data = reinterpret_cast<uint8_t*>(face_pixels_);
+        face_view_ = lv_image_create(emoji_box_);
+        lv_image_set_src(face_view_, &face_image_);
+        lv_obj_center(face_view_);
+        DrawFaceLocked("neutral");
+    }
+
+    emoji_label_ = lv_label_create(emoji_box_);
+    lv_obj_set_style_text_font(emoji_label_, theme->large_icon_font()->font(), 0);
+    lv_label_set_text(emoji_label_, MATERIAL_SYMBOLS_ROBOT_2);
+    lv_obj_center(emoji_label_);
+    if (face_view_) lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+    emoji_image_ = lv_image_create(emoji_box_);
+    lv_obj_center(emoji_image_);
+    lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+
+    preview_image_ = lv_image_create(agent_stage_);
+    lv_obj_align(preview_image_, LV_ALIGN_CENTER, 0, 11);
+    lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
+
+    bottom_bar_ = lv_obj_create(container_);
+    lv_obj_set_size(bottom_bar_, width_, 76);
+    lv_obj_set_pos(bottom_bar_, 0, height_ - 76);
+    lv_obj_set_style_pad_all(bottom_bar_, 0, 0);
+    lv_obj_set_style_radius(bottom_bar_, 0, 0);
+    lv_obj_set_style_border_width(bottom_bar_, 2, 0);
+    lv_obj_set_style_border_side(bottom_bar_, LV_BORDER_SIDE_TOP, 0);
+    lv_obj_set_scrollbar_mode(bottom_bar_, LV_SCROLLBAR_MODE_OFF);
+
+    role_label_ = lv_label_create(bottom_bar_);
+    lv_obj_set_pos(role_label_, 16, 5);
+    chat_message_label_ = lv_label_create(bottom_bar_);
+    lv_obj_set_size(chat_message_label_, width_ - 32, 48);
+    lv_obj_set_pos(chat_message_label_, 16, 26);
+    lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_WRAP);
+    UpdateConversationLocked();
+
+    low_battery_popup_ = lv_obj_create(screen);
+    lv_obj_set_size(low_battery_popup_, width_ - 36, 48);
+    lv_obj_align(low_battery_popup_, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_scrollbar_mode(low_battery_popup_, LV_SCROLLBAR_MODE_OFF);
+    low_battery_label_ = lv_label_create(low_battery_popup_);
+    lv_label_set_text(low_battery_label_, "电量低，请充电");
+    lv_obj_center(low_battery_label_);
+    lv_obj_add_flag(low_battery_popup_, LV_OBJ_FLAG_HIDDEN);
+    ApplyPaletteLocked();
+}
+
+void CustomLcdDisplay::ApplyPaletteLocked() {
+    const lv_color_t paper = lv_color_white();
+    const lv_color_t ink = lv_color_black();
+    lv_obj_set_style_bg_color(lv_screen_active(), paper, 0);
+    lv_obj_set_style_text_color(lv_screen_active(), ink, 0);
+    for (auto* panel : {container_, top_bar_, agent_stage_, bottom_bar_}) {
+        if (!panel) continue;
+        lv_obj_set_style_bg_color(panel, paper, 0);
+        lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(panel, ink, 0);
+        lv_obj_set_style_text_color(panel, ink, 0);
+    }
+    for (auto* label : {network_label_, status_label_, notification_label_, mute_label_,
+                        battery_label_, role_label_, chat_message_label_, emoji_label_}) {
+        if (label) lv_obj_set_style_text_color(label, ink, 0);
+    }
+    if (low_battery_popup_) {
+        lv_obj_set_style_bg_color(low_battery_popup_, ink, 0);
+        lv_obj_set_style_border_width(low_battery_popup_, 0, 0);
+        lv_obj_set_style_radius(low_battery_popup_, 8, 0);
+        lv_obj_set_style_text_color(low_battery_label_, paper, 0);
+    }
+}
+
+void CustomLcdDisplay::SetTheme(Theme* theme) {
+    LcdDisplay::SetTheme(theme);
+    DisplayLockGuard lock(this);
+    if (lock && setup_ui_called_) ApplyPaletteLocked();
+}
+
+void CustomLcdDisplay::DrawFaceLocked(const char* emotion) {
+    if (!face_pixels_ || !face_view_) return;
+    std::fill_n(face_pixels_, kFaceWidth * kFaceHeight, kPaper);
+    // Thick circular silhouette and separate eyes remain legible on this 1-bit panel.
+    for (int y = 10; y <= 110; ++y) {
+        for (int x = 30; x <= 130; ++x) {
+            const int dx = x - 80;
+            const int dy = y - 60;
+            const int d2 = dx * dx + dy * dy;
+            if (d2 >= 47 * 47 && d2 <= 50 * 50) Plot(face_pixels_, x, y);
+        }
+    }
+    const bool sleepy = strcmp(emotion, "sleepy") == 0;
+    for (int x : {60, 100}) {
+        if (sleepy) {
+            for (int dx = -8; dx <= 8; ++dx) Plot(face_pixels_, x + dx, 47, 2);
+        } else {
+            Plot(face_pixels_, x, 47, 6);
+        }
+    }
+    if (strcmp(emotion, "surprised") == 0) {
+        for (int y = 71; y <= 96; ++y) {
+            for (int x = 69; x <= 91; ++x) {
+                const int dx = x - 80;
+                const int dy = y - 83;
+                const int d = dx * dx * 144 + dy * dy * 121;
+                if (d >= 12000 && d <= 17500) Plot(face_pixels_, x, y, 1);
+            }
+        }
+    } else if (strcmp(emotion, "happy") == 0 || strcmp(emotion, "sad") == 0) {
+        const bool happy = strcmp(emotion, "happy") == 0;
+        for (int x = 55; x <= 105; ++x) {
+            const int dx = x - 80;
+            const int curve = (625 - dx * dx) * 13 / 625;
+            Plot(face_pixels_, x, happy ? 77 + curve : 90 - curve, 2);
+        }
+    } else {
+        for (int x = 61; x <= 99; ++x) Plot(face_pixels_, x, 82, 2);
+    }
+    lv_obj_invalidate(face_view_);
+}
+
+void CustomLcdDisplay::UpdateConversationLocked() {
+    if (!role_label_ || !chat_message_label_) return;
+    if (subtitles_hidden_) {
+        lv_label_set_text(role_label_, "DIALOGUE / HIDDEN");
+        lv_label_set_text(chat_message_label_, "字幕已隐藏");
+        return;
+    }
+    const char* role = chat_role_ == "user" ? "YOU" :
+                       chat_role_ == "assistant" ? "AGENT" : "SYSTEM";
+    lv_label_set_text(role_label_, role);
+    lv_label_set_text(chat_message_label_,
+                      chat_content_.empty() ? "按下按键开始对话" : chat_content_.c_str());
+}
+
+void CustomLcdDisplay::SetChatMessage(const char* role, const char* content) {
+    DisplayLockGuard lock(this);
+    if (!lock) return;
+    chat_role_ = role ? role : "system";
+    chat_content_ = content ? content : "";
+    UpdateConversationLocked();
+}
+
+void CustomLcdDisplay::ClearChatMessages() {
+    SetChatMessage("system", "");
+}
+
+void CustomLcdDisplay::SetHideSubtitle(bool hide) {
+    DisplayLockGuard lock(this);
+    if (!lock) return;
+    subtitles_hidden_ = hide;
+    UpdateConversationLocked();
+}
+
+void CustomLcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
+    DisplayLockGuard lock(this);
+    if (!lock || !preview_image_) return;
+    if (!image) {
+        esp_timer_stop(preview_timer_);
+        lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
+        lv_image_set_src(preview_image_, nullptr);
+        preview_image_cached_.reset();
+        if (!temporary_bitmap_active_.load()) lv_obj_remove_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+        if (gif_controller_) gif_controller_->Start();
+        return;
+    }
+    ClearTemporaryBitmapLocked();
+    preview_image_cached_ = std::move(image);
+    auto* descriptor = preview_image_cached_->image_dsc();
+    if (!descriptor || !descriptor->header.w || !descriptor->header.h) {
+        preview_image_cached_.reset();
+        return;
+    }
+    const int max_width = width_ - 68;
+    const int max_height = 140;
+    const int scale = std::min({256, 256 * max_width / descriptor->header.w,
+                               256 * max_height / descriptor->header.h});
+    lv_image_set_src(preview_image_, descriptor);
+    lv_image_set_scale(preview_image_, scale);
+    lv_obj_align(preview_image_, LV_ALIGN_CENTER, 0, 11);
+    if (gif_controller_) gif_controller_->Stop();
+    lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
+    esp_timer_stop(preview_timer_);
+    ESP_ERROR_CHECK(esp_timer_start_once(preview_timer_, PREVIEW_IMAGE_DURATION_MS * 1000));
 }
 
 void CustomLcdDisplay::ClearTemporaryBitmapLocked() {
@@ -141,6 +459,10 @@ void CustomLcdDisplay::ClearTemporaryBitmapLocked() {
         temporary_bitmap_image_ = {};
     }
     temporary_bitmap_active_.store(false);
+    if (emoji_box_ && preview_image_ &&
+        lv_obj_has_flag(preview_image_, LV_OBJ_FLAG_HIDDEN)) {
+        lv_obj_remove_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 void CustomLcdDisplay::SetEmotion(const char* emotion) {
@@ -150,6 +472,14 @@ void CustomLcdDisplay::SetEmotion(const char* emotion) {
             current_emotion_ = emotion;
             ClearTemporaryBitmapLocked();
         }
+        if (lock && face_view_ && IsFaceEmotion(emotion)) {
+            DrawFaceLocked(emotion);
+            lv_obj_remove_flag(face_view_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+            return;
+        }
+        if (lock && face_view_) lv_obj_add_flag(face_view_, LV_OBJ_FLAG_HIDDEN);
     }
     LcdDisplay::SetEmotion(emotion);
 }
@@ -157,7 +487,7 @@ void CustomLcdDisplay::SetEmotion(const char* emotion) {
 bool CustomLcdDisplay::ShowTemporaryBitmap(const std::vector<uint8_t>& bits, int width,
                                             int height, uint32_t duration_ms) {
     const size_t stride = (width + 7) / 8;
-    if (width < 1 || width > 160 || height < 1 || height > 120 ||
+    if (!agent_stage_ || width < 1 || width > 160 || height < 1 || height > 120 ||
         bits.size() != stride * height || duration_ms < 100 || duration_ms > 60000) {
         return false;
     }
@@ -175,6 +505,10 @@ bool CustomLcdDisplay::ShowTemporaryBitmap(const std::vector<uint8_t>& bits, int
         heap_caps_free(pixels);
         return false;
     }
+    esp_timer_stop(preview_timer_);
+    lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
+    lv_image_set_src(preview_image_, nullptr);
+    preview_image_cached_.reset();
     ClearTemporaryBitmapLocked();
     temporary_bitmap_image_.header.magic = LV_IMAGE_HEADER_MAGIC;
     temporary_bitmap_image_.header.cf = LV_COLOR_FORMAT_RGB565;
@@ -183,14 +517,16 @@ bool CustomLcdDisplay::ShowTemporaryBitmap(const std::vector<uint8_t>& bits, int
     temporary_bitmap_image_.header.stride = width * sizeof(uint16_t);
     temporary_bitmap_image_.data_size = width * height * sizeof(uint16_t);
     temporary_bitmap_image_.data = reinterpret_cast<uint8_t*>(pixels);
-    temporary_bitmap_ = lv_image_create(lv_screen_active());
+    temporary_bitmap_ = lv_image_create(agent_stage_);
     if (!temporary_bitmap_) {
         ClearTemporaryBitmapLocked();
         return false;
     }
     lv_image_set_src(temporary_bitmap_, &temporary_bitmap_image_);
-    lv_obj_center(temporary_bitmap_);
+    lv_obj_align(temporary_bitmap_, LV_ALIGN_CENTER, 0, 11);
     lv_obj_move_foreground(temporary_bitmap_);
+    lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
     temporary_bitmap_timer_ = lv_timer_create([](lv_timer_t* timer) {
         auto* display = static_cast<CustomLcdDisplay*>(lv_timer_get_user_data(timer));
         display->ClearTemporaryBitmapLocked();
