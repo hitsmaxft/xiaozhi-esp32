@@ -799,7 +799,10 @@ void DeviceUseWifi::Run() {
                 } else {
                     if (scene != 0) scene_id_ = scene;
                     if (scene == 0) {
-                        if (bitmap_was_active_) Event(14, bitmap_operation_id_, 1);
+                        if (bitmap_was_active_) {
+                            FinishCall(bitmap_operation_id_, true);
+                            Event(14, bitmap_operation_id_, 1);
+                        }
                         bitmap_operation_id_ = done;
                         bitmap_was_active_ = true;
                         bitmap_expires_at_ms_ = NowMs() + bitmap_duration_ms_;
