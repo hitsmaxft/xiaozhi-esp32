@@ -36,6 +36,26 @@ void Plot(uint16_t* pixels, int x, int y, int radius = 0) {
     }
 }
 
+void FillEye(uint16_t* pixels, int center_x, int center_y, int width, int height) {
+    const int left = center_x - width / 2;
+    const int top = center_y - height / 2;
+    const int radius = std::min(width, height) / 3;
+    for (int y = top; y < top + height; ++y) {
+        for (int x = left; x < left + width; ++x) {
+            const int dx = std::max({left + radius - x, 0, x - (left + width - radius - 1)});
+            const int dy = std::max({top + radius - y, 0, y - (top + height - radius - 1)});
+            if (dx * dx + dy * dy <= radius * radius) Plot(pixels, x, y);
+        }
+    }
+}
+
+void DrawEyeCurve(uint16_t* pixels, int center_x, int center_y, bool happy) {
+    for (int dx = -23; dx <= 23; ++dx) {
+        const int rise = (529 - dx * dx) * 17 / 529;
+        Plot(pixels, center_x + dx, center_y + (happy ? -rise : rise), 3);
+    }
+}
+
 bool IsFaceEmotion(const char* emotion) {
     return emotion && (strcmp(emotion, "neutral") == 0 ||
         strcmp(emotion, "robot_2") == 0 || strcmp(emotion, "happy") == 0 ||
@@ -157,6 +177,10 @@ CustomLcdDisplay::~CustomLcdDisplay() {
     DisplayLockGuard lock(this);
     if (lock) {
         ClearTemporaryBitmapLocked();
+        if (face_timer_) {
+            lv_timer_delete(face_timer_);
+            face_timer_ = nullptr;
+        }
         if (face_view_) {
             lv_obj_delete(face_view_);
             face_view_ = nullptr;
@@ -256,6 +280,17 @@ void CustomLcdDisplay::SetupUI() {
         lv_image_set_src(face_view_, &face_image_);
         lv_obj_center(face_view_);
         DrawFaceLocked("neutral");
+        face_timer_ = lv_timer_create([](lv_timer_t* timer) {
+            auto* self = static_cast<CustomLcdDisplay*>(lv_timer_get_user_data(timer));
+            ++self->face_frame_;
+            const auto frame = self->face_frame_;
+            const bool changed = frame % 50 <= 4 || frame % 18 == 0;
+            if (changed && self->face_view_ &&
+                !lv_obj_has_flag(self->face_view_, LV_OBJ_FLAG_HIDDEN) &&
+                !lv_obj_has_flag(self->emoji_box_, LV_OBJ_FLAG_HIDDEN)) {
+                self->DrawFaceLocked(self->current_emotion_.c_str());
+            }
+        }, 100, this);
     }
 
     emoji_label_ = lv_label_create(emoji_box_);
@@ -330,41 +365,28 @@ void CustomLcdDisplay::SetTheme(Theme* theme) {
 void CustomLcdDisplay::DrawFaceLocked(const char* emotion) {
     if (!face_pixels_ || !face_view_) return;
     std::fill_n(face_pixels_, kFaceWidth * kFaceHeight, kPaper);
-    // Thick circular silhouette and separate eyes remain legible on this 1-bit panel.
-    for (int y = 10; y <= 110; ++y) {
-        for (int x = 30; x <= 130; ++x) {
-            const int dx = x - 80;
-            const int dy = y - 60;
-            const int d2 = dx * dx + dy * dy;
-            if (d2 >= 47 * 47 && d2 <= 50 * 50) Plot(face_pixels_, x, y);
-        }
-    }
+    const bool happy = strcmp(emotion, "happy") == 0;
+    const bool sad = strcmp(emotion, "sad") == 0;
+    const bool surprised = strcmp(emotion, "surprised") == 0;
     const bool sleepy = strcmp(emotion, "sleepy") == 0;
-    for (int x : {60, 100}) {
-        if (sleepy) {
-            for (int dx = -8; dx <= 8; ++dx) Plot(face_pixels_, x + dx, 47, 2);
+    // A short blink every five seconds; all states share the same glance rhythm.
+    const int cycle = face_frame_ % 50;
+    const int blink_height = cycle == 0 || cycle == 3 ? 16 :
+                             cycle == 1 || cycle == 2 ? 6 : 0;
+    const int glance = ((face_frame_ / 18) % 4 == 1) ? -5 :
+                       ((face_frame_ / 18) % 4 == 3) ? 5 : 0;
+    for (int center_x : {50, 110}) {
+        const int x = center_x + glance;
+        if (blink_height || sleepy) {
+            FillEye(face_pixels_, x, 61, 42, sleepy ? 6 : blink_height);
+        } else if (happy || sad) {
+            DrawEyeCurve(face_pixels_, x, happy ? 72 : 49, happy);
+        } else if (surprised) {
+            FillEye(face_pixels_, x, 59, 40, 57);
+            for (int dx = -18; dx <= 18; ++dx) Plot(face_pixels_, x + dx, 17, 2);
         } else {
-            Plot(face_pixels_, x, 47, 6);
+            FillEye(face_pixels_, x, 61, 42, 45);
         }
-    }
-    if (strcmp(emotion, "surprised") == 0) {
-        for (int y = 71; y <= 96; ++y) {
-            for (int x = 69; x <= 91; ++x) {
-                const int dx = x - 80;
-                const int dy = y - 83;
-                const int d = dx * dx * 144 + dy * dy * 121;
-                if (d >= 12000 && d <= 17500) Plot(face_pixels_, x, y, 1);
-            }
-        }
-    } else if (strcmp(emotion, "happy") == 0 || strcmp(emotion, "sad") == 0) {
-        const bool happy = strcmp(emotion, "happy") == 0;
-        for (int x = 55; x <= 105; ++x) {
-            const int dx = x - 80;
-            const int curve = (625 - dx * dx) * 13 / 625;
-            Plot(face_pixels_, x, happy ? 77 + curve : 90 - curve, 2);
-        }
-    } else {
-        for (int x = 61; x <= 99; ++x) Plot(face_pixels_, x, 82, 2);
     }
     lv_obj_invalidate(face_view_);
 }

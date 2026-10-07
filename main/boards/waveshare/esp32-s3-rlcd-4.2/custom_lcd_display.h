@@ -24,6 +24,7 @@ class CustomLcdDisplay : public LcdDisplay {
 private:
     lv_obj_t* agent_stage_ = nullptr;
     lv_obj_t* face_view_ = nullptr;
+    lv_timer_t* face_timer_ = nullptr;
     uint16_t* face_pixels_ = nullptr;
     lv_img_dsc_t face_image_{};
     std::string chat_content_;
@@ -32,7 +33,8 @@ private:
     lv_timer_t* temporary_bitmap_timer_ = nullptr;
     lv_img_dsc_t temporary_bitmap_image_{};
     std::atomic<bool> temporary_bitmap_active_{false};
-    std::string current_emotion_;
+    std::string current_emotion_ = "neutral";
+    uint32_t face_frame_ = 5;
     void ClearTemporaryBitmapLocked();
     void DrawFaceLocked(const char* emotion);
     void UpdateConversationLocked();
